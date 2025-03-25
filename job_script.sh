@@ -38,6 +38,8 @@ tar --use-compress-program=unzstd -xvf val_resize_origine.tar.zst
 cd $SLURM_TMPDIR
 
 # My code
+# If not ssh connexion
+# git clone https://github.com/kevinNguetche/Video-FocalNets.git 
 git clone git@github.com:kevinNguetche/Video-FocalNets.git
 cd Video-FocalNets
 git checkout custom_videofocalnet_8
