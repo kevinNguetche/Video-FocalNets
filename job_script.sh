@@ -38,10 +38,10 @@ tar --use-compress-program=unzstd -xvf val_resize_origine.tar.zst
 cd $SLURM_TMPDIR
 
 # My code
-git clone git@github.com:srikanth-sfu/unmasked_teacher.git
-cd unmasked_teacher
-git checkout tubelet_umt_s12
-cd single_modality
+git clone git@github.com:kevinNguetche/Video-FocalNets.git
+cd Video-FocalNets
+git checkout custom_videofocalnet_8
+cp -r /home/dilan/projects/def-mpederso/dilan/focalnet_base_srf.pth .
 
 # Cmd launch
 timeout 119m python -u -m torch.distributed.launch --nproc_per_node 4 main.py  \
