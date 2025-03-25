@@ -41,7 +41,8 @@ cd $SLURM_TMPDIR
 # If not ssh connexion
 # git clone https://github.com/kevinNguetche/Video-FocalNets.git 
 git clone git@github.com:kevinNguetche/Video-FocalNets.git
-cd Video-FocalNets
+mv Video-FocalNets Video-FocalNets_8
+cd Video-FocalNets_8
 git checkout custom_videofocalnet_8
 cp -r /home/dilan/projects/def-mpederso/dilan/focalnet_base_srf.pth .
 
