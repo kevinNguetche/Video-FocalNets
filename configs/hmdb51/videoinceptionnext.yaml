@@ -1,0 +1,44 @@
+DATA:
+  ROOT: ''
+  TRAIN_FILE: './datasets/train_hmdb51.csv'
+  VAL_FILE: './datasets/val_hmdb51.csv'
+  DATASET: hmdb51
+  NUM_FRAMES: 8
+  NUM_CLASSES: 51
+  LABEL_LIST: './labels/hmdb_51_labels.csv'
+  BATCH_SIZE: 1
+
+MODEL:
+  TYPE: videoinceptionnext_base_384
+  NAME: videoinceptionnext_base_384
+  DROP_PATH_RATE: 0.1  # Adjust according to your needs
+  NUM_CLASSES: 51  # Set according to your dataset
+  VIDEOINCEPTIONNEXT:
+    DEPTHS: [3, 3, 27, 3]  # Depths of each stage in the model
+    DIMS: [128, 256, 512, 1024]  # Feature map dimensions at each stage
+    MLP_RATIOS: [4, 4, 4, 3]  # MLP expansion ratios for each stage
+    #TOKEN_MIXERS: 'InceptionDWConv3d'  # Referencing the token mixer from the corresponding file
+    LS_INIT_VALUE: 1e-6  # Initial value for LayerScale
+
+TRAIN:
+  BASE_LR: 0.1  # Base learning rate
+  WARMUP_LR: 0.001  # Learning rate during the warmup phase
+  MIN_LR: 0.001  # Minimum learning rate after decay
+  EPOCHS: 1  # Number of training epochs
+  WEIGHT_DECAY: 1e-4  # Regularization strength
+  OPTIMIZER:
+    NAME: 'sgd'  # Optimizer choice
+  WARMUP_EPOCHS: 20  # Number of warmup epochs
+  PRETRAINED_PATH: ''  # Path to pretrained weights, if any
+
+AUG:
+  FRAME_INTERVAL: 4  # Frame interval for video augmentation
+  FLIP_RATIO: 0.5  # Probability of horizontal flipping
+  COLOR_JITTER: 0.8  # Strength of color jittering
+  GRAY_SCALE: 0.2  # Probability of converting to grayscale
+  MIXUP: 0.8  # Mixup alpha parameter
+  MIXUP_PROB: 0.5  # Probability of applying mixup
+
+SAVE_FREQ: 10  # Frequency of model checkpoints
+
+

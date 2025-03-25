@@ -443,7 +443,7 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = [num_frame//self.tubelet_size for num_frame in num_frames]
+        self.num_frames = num_frames//self.tubelet_size
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -486,7 +486,7 @@ class VideoFocalNet(nn.Module):
                                use_postln=use_postln,
                                use_postln_in_modulation=use_postln_in_modulation, 
                                normalize_modulator=normalize_modulator,
-                               num_frames=self.num_frames[i_layer]
+                               num_frames=self.num_frames
                     )
             self.layers.append(layer)
 
@@ -516,34 +516,12 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
-        for idx, layer in enumerate (self.layers):
+
+        for layer in self.layers:
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
-                pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
-                curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
-                
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        
         return x
 
     def forward(self, x):
@@ -552,7 +530,7 @@ class VideoFocalNet(nn.Module):
             x =  x.reshape(-1,c,h,w)
         x = self.forward_features(x)
         # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames[-1], x.shape[-1])
+        x = x.view(b, self.num_frames, x.shape[-1])
         x = x.mean(dim=1)
         x = self.head(x)
         return x

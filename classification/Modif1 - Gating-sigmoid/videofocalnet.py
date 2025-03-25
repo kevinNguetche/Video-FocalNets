@@ -1,8 +1,6 @@
 # --------------------------------------------------------
 # FocalNets -- Focal Modulation Networks
-# Copyright (c) 2022 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Jianwei Yang (jianwyan@microsoft.com)
+# Modified to include adjusted gating mechanism
 # --------------------------------------------------------
 
 import torch
@@ -14,7 +12,6 @@ from timm.models.registry import register_model
 
 from torchvision import transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.data import create_transform
 from timm.data.transforms import str_to_pil_interp
 from einops import rearrange
 
@@ -38,7 +35,7 @@ class Mlp(nn.Module):
 
 class SpatioTemporalFocalModulation(nn.Module):
     def __init__(self, dim, focal_window, focal_level, focal_factor=2, bias=True, proj_drop=0.,
-                use_postln_in_modulation=False, normalize_modulator=False, num_frames=8):
+                 use_postln_in_modulation=False, normalize_modulator=False, num_frames=8):
         super().__init__()
 
         self.dim = dim
@@ -49,7 +46,7 @@ class SpatioTemporalFocalModulation(nn.Module):
         self.normalize_modulator = normalize_modulator
         self.num_frames = num_frames
 
-        self.f = nn.Linear(dim, 2*dim + (self.focal_level+1), bias=bias)
+        self.f = nn.Linear(dim, 2 * dim + (self.focal_level + 1), bias=bias)
         self.h = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=bias)
 
         self.act = nn.GELU()
@@ -57,30 +54,31 @@ class SpatioTemporalFocalModulation(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.focal_layers = nn.ModuleList()
 
-        self.f_temporal = nn.Linear(dim, dim + (self.focal_level+1), bias=bias)
+        self.f_temporal = nn.Linear(dim, dim + (self.focal_level + 1), bias=bias)
         self.h_temporal = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=bias)
         self.focal_layers_temporal = nn.ModuleList()
-                
+
         self.kernel_sizes = []
         for k in range(self.focal_level):
-            kernel_size = self.focal_factor*k + self.focal_window
+            kernel_size = self.focal_factor * k + self.focal_window
             self.focal_layers.append(
                 nn.Sequential(
-                    nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, 
-                    groups=dim, padding=kernel_size//2, bias=False),
+                    nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1,
+                              groups=dim, padding=kernel_size // 2, bias=False),
                     nn.GELU(),
-                    )
                 )
+            )
             self.kernel_sizes.append(kernel_size)
-        
+
         for k in range(self.focal_level):
-            kernel_size = self.focal_factor*k + self.focal_window
+            kernel_size = self.focal_factor * k + self.focal_window
             self.focal_layers_temporal.append(
                 nn.Sequential(
                     nn.Conv1d(dim, dim, kernel_size=kernel_size, stride=1,
-                    padding=kernel_size//2, bias=False), nn.GELU(),
-                    )
+                              padding=kernel_size // 2, bias=False),
+                    nn.GELU(),
                 )
+            )
 
         if self.use_postln_in_modulation:
             self.ln = nn.LayerNorm(dim)
@@ -92,49 +90,60 @@ class SpatioTemporalFocalModulation(nn.Module):
         """
         B, H, W, C = x.shape
 
-        # pre linear projection temporal
-        x_temporal = torch.clone(x)
-        x_temporal = rearrange(x_temporal, '(b t) h w c -> (b h w) t c', t=self.num_frames, h=H, w=W)
-        x_temporal = self.f_temporal(x_temporal).permute(0, 2, 1).contiguous()
-        ctx_temporal, self.gates_temporal = torch.split(x_temporal, (C, self.focal_level+1), 1)
+        # Pre linear projection temporal
+        x_temporal = x.view(B // self.num_frames, self.num_frames, H, W, C)
+        x_temporal = x_temporal.permute(0, 2, 3, 1, 4).contiguous()  # (B', H, W, T, C)
+        x_temporal = x_temporal.view(-1, self.num_frames, C)  # (B'*H*W, T, C)
+        x_temporal = self.f_temporal(x_temporal)
+        ctx_temporal, gates_temporal = torch.split(x_temporal, [C, self.focal_level + 1], dim=2)
+        gates_temporal = torch.sigmoid(gates_temporal)  # Apply sigmoid to get values between 0 and 1
 
-        # context aggregration temporal
-        ctx_all_temporal = 0 
+        # Context aggregation temporal with gating
+        ctx_all_temporal = 0
         for l in range(self.focal_level):
-            ctx_temporal = self.focal_layers_temporal[l](ctx_temporal)
-            ctx_all_temporal = ctx_all_temporal + ctx_temporal*self.gates_temporal[:, l:l+1]
-        ctx_global_temporal = self.act(ctx_temporal.mean(2, keepdim=True))
-        ctx_all_temporal = ctx_all_temporal + ctx_global_temporal*self.gates_temporal[:,self.focal_level:]
+            gate = gates_temporal[:, :, l:l+1]
+            ctx_l = self.focal_layers_temporal[l](ctx_temporal.permute(0, 2, 1))  # (B'*H*W, C, T)
+            ctx_l = ctx_l.permute(0, 2, 1)  # (B'*H*W, T, C)
+            ctx_all_temporal = ctx_all_temporal + ctx_l * gate
+        # Global context
+        ctx_global_temporal = self.act(ctx_temporal.mean(1, keepdim=True))
+        ctx_all_temporal = ctx_all_temporal + ctx_global_temporal * gates_temporal[:, :, self.focal_level:]
 
-        # pre linear projection spatial
-        x = self.f(x).permute(0, 3, 1, 2).contiguous()
-        q, ctx, self.gates = torch.split(x, (C, C, self.focal_level+1), 1)
-        
-        # context aggreation spatial
-        ctx_all = 0
-        for l in range(self.focal_level):         
-            ctx = self.focal_layers[l](ctx)
-            ctx_all = ctx_all + ctx*self.gates[:, l:l+1]
-        ctx_global = self.act(ctx.mean(2, keepdim=True).mean(3, keepdim=True))
-        ctx_all = ctx_all + ctx_global*self.gates[:,self.focal_level:]
+        # Pre linear projection spatial
+        x_spatial = x.view(B, H * W, C)
+        x_spatial = self.f(x_spatial)
+        q, ctx_spatial, gates_spatial = torch.split(x_spatial, [C, C, self.focal_level + 1], dim=2)
+        q = q.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
+        ctx_spatial = ctx_spatial.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
+        gates_spatial = torch.sigmoid(gates_spatial.view(B, H, W, self.focal_level + 1).permute(0, 3, 1, 2))
 
-        # normalize context
+        # Context aggregation spatial with gating
+        ctx_all_spatial = 0
+        for l in range(self.focal_level):
+            gate = gates_spatial[:, l:l+1, :, :]
+            ctx_l = self.focal_layers[l](ctx_spatial)
+            ctx_all_spatial = ctx_all_spatial + ctx_l * gate
+        # Global context
+        ctx_global_spatial = self.act(ctx_spatial.mean(2, keepdim=True).mean(3, keepdim=True))
+        ctx_all_spatial = ctx_all_spatial + ctx_global_spatial * gates_spatial[:, self.focal_level:, :, :]
+
+        # Normalize context
         if self.normalize_modulator:
-            ctx_all_temporal = ctx_all_temporal / (self.focal_level+1)
-            ctx_all = ctx_all / (self.focal_level+1)
+            ctx_all_temporal = ctx_all_temporal / (self.focal_level + 1)
+            ctx_all_spatial = ctx_all_spatial / (self.focal_level + 1)
 
-        # focal modulation
-        self.modulator_temporal = self.h_temporal(ctx_all_temporal)
-        self.modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) c h w', t=self.num_frames, h=H, w=W)
+        # Focal modulation
+        modulator_temporal = self.h_temporal(ctx_all_temporal.permute(0, 2, 1))
+        modulator_temporal = modulator_temporal.view(-1, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
 
-        self.modulator = self.h(ctx_all)
+        modulator_spatial = self.h(ctx_all_spatial)
 
-        x_out = q*self.modulator*self.modulator_temporal
+        x_out = q * modulator_spatial * modulator_temporal
         x_out = x_out.permute(0, 2, 3, 1).contiguous()
         if self.use_postln_in_modulation:
             x_out = self.ln(x_out)
-        
-        # post linear porjection
+
+        # Post linear projection
         x_out = self.proj(x_out)
         x_out = self.proj_drop(x_out)
         return x_out
@@ -147,25 +156,25 @@ class VideoFocalNetBlock(nn.Module):
 
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
+        input_resolution (tuple[int]): Input resolution.
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
         drop (float, optional): Dropout rate. Default: 0.0
         drop_path (float, optional): Stochastic depth rate. Default: 0.0
         act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-        focal_level (int): Number of focal levels. 
+        focal_level (int): Number of focal levels.
         focal_window (int): Focal window size at first focal level
-        use_layerscale (bool): Whether use layerscale
+        use_layerscale (bool): Whether to use layerscale
         layerscale_value (float): Initial layerscale value
-        use_postln (bool): Whether use layernorm after modulation
+        use_postln (bool): Whether to use layernorm after modulation
     """
 
-    def __init__(self, dim, input_resolution, mlp_ratio=4., drop=0., drop_path=0., 
-                    act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                    focal_level=1, focal_window=3,
-                    use_layerscale=False, layerscale_value=1e-4, 
-                    use_postln=False, use_postln_in_modulation=False, 
-                    normalize_modulator=False, num_frames=8):
+    def __init__(self, dim, input_resolution, mlp_ratio=4., drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 focal_level=1, focal_window=3,
+                 use_layerscale=False, layerscale_value=1e-4,
+                 use_postln=False, use_postln_in_modulation=False,
+                 normalize_modulator=False, num_frames=8):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -178,7 +187,7 @@ class VideoFocalNetBlock(nn.Module):
 
         self.norm1 = norm_layer(dim)
         self.modulation = SpatioTemporalFocalModulation(
-            dim, proj_drop=drop, focal_window=focal_window, focal_level=self.focal_level, 
+            dim, proj_drop=drop, focal_window=focal_window, focal_level=self.focal_level,
             use_postln_in_modulation=use_postln_in_modulation, normalize_modulator=normalize_modulator,
             num_frames=self.num_frames
         )
@@ -189,7 +198,7 @@ class VideoFocalNetBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         self.gamma_1 = 1.0
-        self.gamma_2 = 1.0    
+        self.gamma_2 = 1.0
         if use_layerscale:
             self.gamma_1 = nn.Parameter(layerscale_value * torch.ones((dim)), requires_grad=True)
             self.gamma_2 = nn.Parameter(layerscale_value * torch.ones((dim)), requires_grad=True)
@@ -218,7 +227,6 @@ class VideoFocalNetBlock(nn.Module):
         return f"dim={self.dim}, input_resolution={self.input_resolution}, " \
                f"mlp_ratio={self.mlp_ratio}"
 
-
 class BasicLayer(nn.Module):
     """ A basic Focal Transformer layer for one stage.
 
@@ -226,10 +234,7 @@ class BasicLayer(nn.Module):
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resolution.
         depth (int): Number of blocks.
-        window_size (int): Local window size.
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
         drop (float, optional): Dropout rate. Default: 0.0
         drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
         norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
@@ -243,13 +248,13 @@ class BasicLayer(nn.Module):
     """
 
     def __init__(self, dim, out_dim, input_resolution, depth,
-                 mlp_ratio=4., drop=0., drop_path=0., norm_layer=nn.LayerNorm, 
-                 downsample=None, use_checkpoint=False, 
-                 focal_level=1, focal_window=1, 
-                 use_conv_embed=False, 
-                 use_layerscale=False, layerscale_value=1e-4, 
-                 use_postln=False, 
-                 use_postln_in_modulation=False, 
+                 mlp_ratio=4., drop=0., drop_path=0., norm_layer=nn.LayerNorm,
+                 downsample=None, use_checkpoint=False,
+                 focal_level=1, focal_window=1,
+                 use_conv_embed=False,
+                 use_layerscale=False, layerscale_value=1e-4,
+                 use_postln=False,
+                 use_postln_in_modulation=False,
                  normalize_modulator=False,
                  num_frames=8):
 
@@ -259,22 +264,22 @@ class BasicLayer(nn.Module):
         self.depth = depth
         self.use_checkpoint = use_checkpoint
         self.num_frames = num_frames
-        
+
         # build blocks
         self.blocks = nn.ModuleList([
             VideoFocalNetBlock(
-                dim=dim, 
+                dim=dim,
                 input_resolution=input_resolution,
-                mlp_ratio=mlp_ratio, 
-                drop=drop, 
+                mlp_ratio=mlp_ratio,
+                drop=drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
                 focal_level=focal_level,
-                focal_window=focal_window, 
-                use_layerscale=use_layerscale, 
+                focal_window=focal_window,
+                use_layerscale=use_layerscale,
                 layerscale_value=layerscale_value,
-                use_postln=use_postln, 
-                use_postln_in_modulation=use_postln_in_modulation, 
+                use_postln=use_postln,
+                use_postln_in_modulation=use_postln_in_modulation,
                 normalize_modulator=normalize_modulator,
                 num_frames=self.num_frames
             )
@@ -282,12 +287,12 @@ class BasicLayer(nn.Module):
 
         if downsample is not None:
             self.downsample = downsample(
-                img_size=input_resolution, 
+                img_size=input_resolution,
                 patch_size=2,
                 in_chans=dim,
                 embed_dim=out_dim,
-                use_conv_embed=use_conv_embed, 
-                norm_layer=norm_layer, 
+                use_conv_embed=use_conv_embed,
+                norm_layer=norm_layer,
                 is_stem=False
             )
         else:
@@ -302,7 +307,6 @@ class BasicLayer(nn.Module):
             else:
                 x = blk(x)
 
-
         if self.downsample is not None:
             x = x.transpose(1, 2).reshape(x.shape[0], -1, H, W)
             x, Ho, Wo = self.downsample(x)
@@ -312,7 +316,6 @@ class BasicLayer(nn.Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
 
 class PatchEmbed(nn.Module):
     r""" Image to Patch Embedding
@@ -326,7 +329,7 @@ class PatchEmbed(nn.Module):
     """
 
     def __init__(self, img_size=(224, 224), patch_size=4, in_chans=3, embed_dim=96,
-                        use_conv_embed=False, norm_layer=None, is_stem=False, tubelet_size=1):
+                 use_conv_embed=False, norm_layer=None, is_stem=False, tubelet_size=1):
         super().__init__()
         patch_size = to_2tuple(patch_size)
         patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
@@ -351,9 +354,9 @@ class PatchEmbed(nn.Module):
                 self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
             else:
                 self.proj = nn.Conv3d(in_channels=in_chans, out_channels=embed_dim,
-                                kernel_size=(tubelet_size,patch_size[0],patch_size[1]),
-                                stride=(tubelet_size,patch_size[0],patch_size[1]))
-        
+                                      kernel_size=(tubelet_size, patch_size[0], patch_size[1]),
+                                      stride=(tubelet_size, patch_size[0], patch_size[1]))
+
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -363,7 +366,7 @@ class PatchEmbed(nn.Module):
         if self.tubelet_size == 1:
             B, C, H, W = x.shape
 
-            x = self.proj(x)        
+            x = self.proj(x)
             H, W = x.shape[2:]
             x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
             if self.norm is not None:
@@ -371,20 +374,18 @@ class PatchEmbed(nn.Module):
             return x, H, W
         else:
             B, T, C, H, W = x.shape
-            x = x.permute(0,2,1,3,4)
+            x = x.permute(0, 2, 1, 3, 4)
             x = self.proj(x)
 
             B, C, T, H, W = x.shape
-            x = x.permute(0,2,1,3,4)
-            x = x.reshape(B*T, C, H, W)
+            x = x.permute(0, 2, 1, 3, 4)
+            x = x.reshape(B * T, C, H, W)
 
             H, W = x.shape[2:]
             x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
             if self.norm is not None:
                 x = self.norm(x)
             return x, H, W
-
-
 
 class VideoFocalNet(nn.Module):
     r"""Spatio Temporal Focal Modulation Networks (Video-FocalNets)
@@ -401,38 +402,38 @@ class VideoFocalNet(nn.Module):
         drop_path_rate (float): Stochastic depth rate. Default: 0.1
         norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
         patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False 
-        focal_levels (list): How many focal levels at all stages. Note that this excludes the finest-grain level. Default: [1, 1, 1, 1] 
-        focal_windows (list): The focal window size at all stages. Default: [7, 5, 3, 1] 
-        use_conv_embed (bool): Whether use convolutional embedding. We noted that using convolutional embedding usually improve the performance, but we do not use it by default. Default: False 
-        use_layerscale (bool): Whether use layerscale proposed in CaiT. Default: False 
-        layerscale_value (float): Value for layer scale. Default: 1e-4 
-        use_postln (bool): Whether use layernorm after modulation (it helps stablize training of large models)
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+        focal_levels (list): How many focal levels at all stages.
+        focal_windows (list): The focal window size at all stages.
+        use_conv_embed (bool): Whether use convolutional embedding.
+        use_layerscale (bool): Whether use layerscale proposed in CaiT. Default: False
+        layerscale_value (float): Value for layer scale. Default: 1e-4
+        use_postln (bool): Whether use layernorm after modulation
     """
-    def __init__(self, 
-                img_size=224, 
-                patch_size=4, 
-                in_chans=3, 
-                num_classes=1000,
-                embed_dim=96, 
-                depths=[2, 2, 6, 2], 
-                mlp_ratio=4., 
-                drop_rate=0., 
-                drop_path_rate=0.1,
-                norm_layer=nn.LayerNorm, 
-                patch_norm=True,
-                use_checkpoint=False,                 
-                focal_levels=[2, 2, 2, 2], 
-                focal_windows=[3, 3, 3, 3], 
-                use_conv_embed=False, 
-                use_layerscale=False, 
-                layerscale_value=1e-4, 
-                use_postln=False, 
-                use_postln_in_modulation=False, 
-                normalize_modulator=False,
-                num_frames=8,
-                tubelet_size=1,
-                **kwargs):
+    def __init__(self,
+                 img_size=224,
+                 patch_size=4,
+                 in_chans=3,
+                 num_classes=1000,
+                 embed_dim=96,
+                 depths=[2, 2, 6, 2],
+                 mlp_ratio=4.,
+                 drop_rate=0.,
+                 drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm,
+                 patch_norm=True,
+                 use_checkpoint=False,
+                 focal_levels=[2, 2, 2, 2],
+                 focal_windows=[3, 3, 3, 3],
+                 use_conv_embed=False,
+                 use_layerscale=False,
+                 layerscale_value=1e-4,
+                 use_postln=False,
+                 use_postln_in_modulation=False,
+                 normalize_modulator=False,
+                 num_frames=8,
+                 tubelet_size=1,
+                 **kwargs):
         super().__init__()
 
         self.num_layers = len(depths)
@@ -442,17 +443,17 @@ class VideoFocalNet(nn.Module):
         self.patch_norm = patch_norm
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
-        self.tubelet_size=tubelet_size
-        self.num_frames = [num_frame//self.tubelet_size for num_frame in num_frames]
-        
+        self.tubelet_size = tubelet_size
+        self.num_frames = num_frames // self.tubelet_size
+
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
-            img_size=to_2tuple(img_size), 
-            patch_size=patch_size, 
-            in_chans=in_chans, 
-            embed_dim=embed_dim[0], 
-            use_conv_embed=use_conv_embed, 
-            norm_layer=norm_layer if self.patch_norm else None, 
+            img_size=to_2tuple(img_size),
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim[0],
+            use_conv_embed=use_conv_embed,
+            norm_layer=norm_layer if self.patch_norm else None,
             is_stem=True,
             tubelet_size=tubelet_size)
 
@@ -467,27 +468,27 @@ class VideoFocalNet(nn.Module):
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=embed_dim[i_layer], 
-                               out_dim=embed_dim[i_layer+1] if (i_layer < self.num_layers - 1) else None,  
+            layer = BasicLayer(dim=embed_dim[i_layer],
+                               out_dim=embed_dim[i_layer + 1] if (i_layer < self.num_layers - 1) else None,
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
                                                  patches_resolution[1] // (2 ** i_layer)),
                                depth=depths[i_layer],
                                mlp_ratio=self.mlp_ratio,
-                               drop=drop_rate, 
+                               drop=drop_rate,
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer, 
+                               norm_layer=norm_layer,
                                downsample=PatchEmbed if (i_layer < self.num_layers - 1) else None,
-                               focal_level=focal_levels[i_layer], 
-                               focal_window=focal_windows[i_layer], 
+                               focal_level=focal_levels[i_layer],
+                               focal_window=focal_windows[i_layer],
                                use_conv_embed=use_conv_embed,
-                               use_checkpoint=use_checkpoint, 
-                               use_layerscale=use_layerscale, 
-                               layerscale_value=layerscale_value, 
+                               use_checkpoint=use_checkpoint,
+                               use_layerscale=use_layerscale,
+                               layerscale_value=layerscale_value,
                                use_postln=use_postln,
-                               use_postln_in_modulation=use_postln_in_modulation, 
+                               use_postln_in_modulation=use_postln_in_modulation,
                                normalize_modulator=normalize_modulator,
-                               num_frames=self.num_frames[i_layer]
-                    )
+                               num_frames=self.num_frames
+                               )
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -516,47 +517,24 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
-        for idx, layer in enumerate (self.layers):
+
+        for layer in self.layers:
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
-                pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
-                curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
-                
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        
         return x
 
     def forward(self, x):
-        b,t,c,h,w = x.size()
-        if self.tubelet_size==1:
-            x =  x.reshape(-1,c,h,w)
+        b, t, c, h, w = x.size()
+        if self.tubelet_size == 1:
+            x = x.reshape(-1, c, h, w)
         x = self.forward_features(x)
         # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames[-1], x.shape[-1])
+        x = x.view(b, self.num_frames, x.shape[-1])
         x = x.mean(dim=1)
         x = self.head(x)
         return x
-
 
 def build_transforms(img_size, center_crop=False):
     t = []
@@ -566,12 +544,12 @@ def build_transforms(img_size, center_crop=False):
             transforms.Resize(size, interpolation=str_to_pil_interp('bicubic'))
         )
         t.append(
-            transforms.CenterCrop(img_size)    
+            transforms.CenterCrop(img_size)
         )
     else:
         t.append(
             transforms.Resize(img_size, interpolation=str_to_pil_interp('bicubic'))
-        )        
+        )
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
     return transforms.Compose(t)
@@ -584,12 +562,12 @@ def build_transforms4display(img_size, center_crop=False):
             transforms.Resize(size, interpolation=str_to_pil_interp('bicubic'))
         )
         t.append(
-            transforms.CenterCrop(img_size)    
+            transforms.CenterCrop(img_size)
         )
     else:
         t.append(
             transforms.Resize(img_size, interpolation=str_to_pil_interp('bicubic'))
-        )  
+        )
     t.append(transforms.ToTensor())
     return transforms.Compose(t)
 
@@ -626,6 +604,6 @@ def videofocalnet_base(pretrained=False, **kwargs):
         model.load_state_dict(checkpoint["model"])
     return model
 
-
 if __name__ == '__main__':
     print('test')
+

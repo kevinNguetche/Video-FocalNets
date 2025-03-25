@@ -11,6 +11,12 @@ import torch
 import torch.distributed as dist
 from timm.models.layers import trunc_normal_
 
+try:
+    # noinspection PyUnresolvedReferences
+    from apex import amp
+except ImportError:
+    amp = None
+
 
 def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
     logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
@@ -40,8 +46,8 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
         config.defrost()
         config.TRAIN.START_EPOCH = checkpoint['epoch'] + 1
         config.freeze()
-        #if 'amp' in checkpoint and config.AMP_OPT_LEVEL != "O0" and checkpoint['config'].AMP_OPT_LEVEL != "O0":
-        #    amp.load_state_dict(checkpoint['amp'])
+        if 'amp' in checkpoint and config.AMP_OPT_LEVEL != "O0" and checkpoint['config'].AMP_OPT_LEVEL != "O0":
+            amp.load_state_dict(checkpoint['amp'])
         logger.info(f"=> loaded successfully '{config.MODEL.RESUME}' (epoch {checkpoint['epoch']})")
         if 'max_accuracy' in checkpoint:
             max_accuracy = checkpoint['max_accuracy']
@@ -58,8 +64,8 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
                   'max_accuracy': max_accuracy,
                   'epoch': epoch,
                   'config': config}
-    #if config.AMP_OPT_LEVEL != "O0":
-    #    save_state['amp'] = amp.state_dict()
+    if config.AMP_OPT_LEVEL != "O0":
+        save_state['amp'] = amp.state_dict()
 
     save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
     logger.info(f"{save_path} saving......")

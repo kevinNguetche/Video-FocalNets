@@ -28,6 +28,12 @@ from logger import create_logger
 from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
 from timm.models.layers import trunc_normal_
 
+try:
+    # noinspection PyUnresolvedReferences
+    from apex import amp
+except ImportError:
+    amp = None
+
 
 def parse_option():
     parser = argparse.ArgumentParser('FocalNet training and evaluation script', add_help=False)
@@ -45,34 +51,27 @@ def parse_option():
     parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
     parser.add_argument('--use-checkpoint', action='store_true',
                         help="whether to use gradient checkpointing to save memory")
-    #parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
-    #                    help='mixed precision opt level, if O0, no amp is used')
+    parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
+                        help='mixed precision opt level, if O0, no amp is used')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder')
-                        
-    parser.add_argument('--prefix', type=str, help='Prefix path for dataset')
-    
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
 
     # distributed training
-    #parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
-	
+    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+
     args, unparsed = parser.parse_known_args()
-    
-    args.local_rank = "cuda:"+os.getenv("LOCAL_RANK")
-    
+
     config = get_config(args)
-    
-    config.PREFIX = args.prefix
-    
+
     return args, config
 
 
 def main(config):
 
     # dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
-    dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config, config.PREFIX)
-	
+    dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config)
+
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     
     model = build_model(config)
@@ -97,7 +96,8 @@ def main(config):
     logger.info(str(model))
 
     optimizer = build_optimizer(config, model)
-    
+    if config.AMP_OPT_LEVEL != "O0":
+        model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
     model_without_ddp = model.module
 
@@ -151,12 +151,12 @@ def main(config):
         
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
-        if epoch == (config.TRAIN.EPOCHS - 1) or epoch == 1 or epoch == 3 or epoch == 5 or epoch % 10 == 0 :
-            acc1 = validate(config, data_loader_val, model)
 
-            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-            max_accuracy = max(max_accuracy, acc1)
-            logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        acc1 = validate(config, data_loader_val, model)
+
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+        max_accuracy = max(max_accuracy, acc1)
+        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
     
     config.defrost()
     config.TEST.NUM_CLIP = 4
@@ -165,7 +165,7 @@ def main(config):
     dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config)
     acc1 = validate(config, data_loader_val, model)
     logger.info(f"Accuracy of the network on the {len(dataset_val)} test videos: {acc1:.1f}%")
-
+	
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
@@ -174,15 +174,12 @@ def main(config):
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
     model.train()
     optimizer.zero_grad()
-    
+
     num_steps = len(data_loader)
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
-    
-    scaler = torch.amp.GradScaler()
-    grad_norm = 0.0
-    
+
     start = time.time()
     end = time.time()
     for idx, batch_data in enumerate(data_loader):
@@ -193,60 +190,49 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
-        
-        ### NEW CODE
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            outputs = model(samples)
+
+        outputs = model(samples)
+
+        if config.TRAIN.ACCUMULATION_STEPS > 1:
             loss = criterion(outputs, targets)
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
-        
-        scaler.scale(loss).backward()
-        if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-
-            if config.TRAIN.CLIP_GRAD:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-
-            scaler.step(optimizer)
-            scaler.update()
+            if config.AMP_OPT_LEVEL != "O0":
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+            else:
+                loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(model.parameters())
+            if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step_update(epoch * num_steps + idx)
+        else:
+            loss = criterion(outputs, targets)
             optimizer.zero_grad()
+            if config.AMP_OPT_LEVEL != "O0":
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+            else:
+                loss.backward()
+                if config.TRAIN.CLIP_GRAD:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                else:
+                    grad_norm = get_grad_norm(model.parameters())
+
+            optimizer.step()
             lr_scheduler.step_update(epoch * num_steps + idx)
-        ### NEW CODE
-        
-        ### OLD CODE
-        # if config.TRAIN.ACCUMULATION_STEPS > 1:
-        #     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-        #         loss = criterion(outputs, targets)
-        #         loss = loss / config.TRAIN.ACCUMULATION_STEPS
-        #         scaler.scale(loss).backward()
 
-        #     if config.TRAIN.CLIP_GRAD:
-        #         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-        #     else:
-        #         grad_norm = get_grad_norm(model.parameters())
-
-        #     if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-        #         scaler.step(optimizer)
-        #         scaler.update()
-        #         optimizer.zero_grad()
-        #         lr_scheduler.step_update(epoch * num_steps + idx)
-        # else:
-        #     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-        #         loss = criterion(outputs, targets)
-
-        #     optimizer.zero_grad()
-            
-        #     scaler.scale(loss).backward()
-        #     if config.TRAIN.CLIP_GRAD:
-        #         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-        #     else:
-        #         grad_norm = get_grad_norm(model.parameters())
-
-        #     scaler.step(optimizer)
-        #     scaler.update()
-        #     lr_scheduler.step_update(epoch * num_steps + idx)
-        ### OLD CODE
-            
         torch.cuda.synchronize()
 
         loss_meter.update(loss.item(), targets.size(0))
@@ -281,7 +267,7 @@ def validate(config, val_loader, model):
             _image = batch_data["imgs"]
             label_id = batch_data["label"]
             label_id = label_id.reshape(-1)
-
+		
             b, tn, c, h, w = _image.size()
             t = config.DATA.NUM_FRAMES[0]
             n = tn // t
@@ -294,10 +280,7 @@ def validate(config, val_loader, model):
                 label_id = label_id.cuda(non_blocking=True)
                 image_input = image.cuda(non_blocking=True)
 
-                ### NEW CODE
-                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    output = model(image_input)
-                ### NEW CODE
+                output = model(image_input)
                 
                 similarity = output.view(b, -1).softmax(dim=-1)
                 tot_similarity += similarity
@@ -326,6 +309,9 @@ def validate(config, val_loader, model):
 
 if __name__ == '__main__':
     _, config = parse_option()
+
+    if config.AMP_OPT_LEVEL != "O0":
+        assert amp is not None, "amp not installed!"
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -375,4 +361,3 @@ if __name__ == '__main__':
     logger.info(config.dump())
 
     main(config)
-

@@ -18,6 +18,77 @@ from timm.data import create_transform
 from timm.data.transforms import str_to_pil_interp
 from einops import rearrange
 
+from scipy.optimize import linear_sum_assignment
+
+def Align(x):
+    """
+    Aligne les features spatiales des frames de manière globale en maximisant la correspondance (profit).
+    
+    Args:
+        x (Tensor): Features avec la forme [T, H, W, C].
+    
+    Returns:
+        x (Tensor): Features alignés avec la forme [T, H, W, C].
+        dealignment (Tensor): Masque binaire pour le désalignement avec la forme [T, HW, HW].
+    """
+    T, H, W, C = x.shape
+    x = x.reshape(T, H * W, C)  # [T, HW, C]
+    
+    # Normaliser toutes les frames pour les rendre comparables
+    normalized_frames = torch.nn.functional.normalize(x, dim=-1).detach()  # [T, HW, C]
+    
+    # Calcul de la matrice de similarité globale (moyenne des similarités de chaque frame avec les autres)
+    similarity_matrix = torch.mean(
+        torch.stack([normalized_frames[i] @ normalized_frames[j].T for i in range(T) for j in range(i + 1, T)]), 
+        dim=0
+    )  # [HW, HW]
+    
+    # Maximisation du profit : inverser la matrice de similarité
+    large_value = similarity_matrix.max().item()
+    cost_matrix = large_value - similarity_matrix.cpu().numpy()  # [HW, HW]
+    
+    # Aligner avec Kuhn-Munkres Algorithm (KMA)
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)  # Utilise la matrice de coût inversé
+    alignment = torch.tensor(col_ind).long().to(x.device)
+    
+    # Réorganiser toutes les frames en une seule fois
+    for ti in range(1, T):
+        x[ti] = x[ti, alignment]  # Aligner chaque frame avec les indices d'alignement
+    
+    # Le dealignment est une simple copie de l'alignement global
+    dealignment = alignment.unsqueeze(0).repeat(T - 1, 1)  # [T-1, HW]
+    
+    # Reshape les features alignés en [T, H, W, C]
+    x = x.reshape(T, H, W, C)  # [T, H, W, C]
+    
+    return x, dealignment
+
+
+def Dealign(x, dealignment):
+    """
+    Désaligne globalement les frames alignées à l'aide des indices de désalignement.
+    
+    Args:
+        x (Tensor): Features alignés avec la forme [T, H, W, C].
+        dealignment (Tensor): Masque binaire produit lors de l'alignement avec la forme [T-1, HW].
+    
+    Returns:
+        x (Tensor): Features désalignés avec la forme [T, H, W, C].
+    """
+    T, H, W, C = x.shape
+    x = x.reshape(T, H * W, C)  # [T, HW, C]
+    
+    # Désaligner toutes les frames en utilisant l'inversion de l'alignement global
+    for ti in range(1, T):
+        alignment = dealignment[0]  # Utiliser le même alignement pour toutes les frames
+        x[ti] = x[ti, alignment.argsort()]  # Inverser l'alignement
+    
+    # Reshape les features désalignés en [T, H, W, C]
+    x = x.reshape(T, H, W, C)  # [T, H, W, C]
+    
+    return x
+
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -81,7 +152,7 @@ class SpatioTemporalFocalModulation(nn.Module):
                     padding=kernel_size//2, bias=False), nn.GELU(),
                     )
                 )
-
+	
         if self.use_postln_in_modulation:
             self.ln = nn.LayerNorm(dim)
 
@@ -91,13 +162,14 @@ class SpatioTemporalFocalModulation(nn.Module):
             x: input features with shape of (B, H, W, C)
         """
         B, H, W, C = x.shape
-
+	
         # pre linear projection temporal
         x_temporal = torch.clone(x)
+        x_temporal, dealignment = Align(x_temporal)
         x_temporal = rearrange(x_temporal, '(b t) h w c -> (b h w) t c', t=self.num_frames, h=H, w=W)
         x_temporal = self.f_temporal(x_temporal).permute(0, 2, 1).contiguous()
         ctx_temporal, self.gates_temporal = torch.split(x_temporal, (C, self.focal_level+1), 1)
-
+        
         # context aggregration temporal
         ctx_all_temporal = 0 
         for l in range(self.focal_level):
@@ -122,13 +194,17 @@ class SpatioTemporalFocalModulation(nn.Module):
         if self.normalize_modulator:
             ctx_all_temporal = ctx_all_temporal / (self.focal_level+1)
             ctx_all = ctx_all / (self.focal_level+1)
-
+        
         # focal modulation
         self.modulator_temporal = self.h_temporal(ctx_all_temporal)
-        self.modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) c h w', t=self.num_frames, h=H, w=W)
-
+        
+        opti_modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) h w c', t=self.num_frames, h=H, w=W)
+        old_temporal = Dealign(opti_modulator_temporal, dealignment)
+        
+        self.modulator_temporal = rearrange(old_temporal, '(b t) h w c -> (b t) c h w', t=self.num_frames, h=H, w=W)
+	
         self.modulator = self.h(ctx_all)
-
+	
         x_out = q*self.modulator*self.modulator_temporal
         x_out = x_out.permute(0, 2, 3, 1).contiguous()
         if self.use_postln_in_modulation:
@@ -443,7 +519,7 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = [num_frame//self.tubelet_size for num_frame in num_frames]
+        self.num_frames = num_frames//self.tubelet_size
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -486,7 +562,7 @@ class VideoFocalNet(nn.Module):
                                use_postln=use_postln,
                                use_postln_in_modulation=use_postln_in_modulation, 
                                normalize_modulator=normalize_modulator,
-                               num_frames=self.num_frames[i_layer]
+                               num_frames=self.num_frames
                     )
             self.layers.append(layer)
 
@@ -516,34 +592,12 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
-        for idx, layer in enumerate (self.layers):
+
+        for layer in self.layers:
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
-                pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
-                curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
-                
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        
         return x
 
     def forward(self, x):
@@ -552,7 +606,7 @@ class VideoFocalNet(nn.Module):
             x =  x.reshape(-1,c,h,w)
         x = self.forward_features(x)
         # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames[-1], x.shape[-1])
+        x = x.view(b, self.num_frames, x.shape[-1])
         x = x.mean(dim=1)
         x = self.head(x)
         return x

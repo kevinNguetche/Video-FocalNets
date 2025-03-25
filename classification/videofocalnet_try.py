@@ -516,34 +516,19 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
+	
         for idx, layer in enumerate (self.layers):
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
+            if ( idx != 0 and idx < len (self.layers)) :
+                print("Start Stage N°" , idx)
                 pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
                 curr_t = self.num_frames[idx]
                 subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
+                x = x[::subsample, :,:]
                 
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        
         return x
 
     def forward(self, x):

@@ -18,6 +18,7 @@ from timm.data import create_transform
 from timm.data.transforms import str_to_pil_interp
 from einops import rearrange
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -36,9 +37,38 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+
+class CrossFrameAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        B, T, N, C = x.shape  # B: batch size, T: num frames, N: num patches, C: channels
+        qkv = self.qkv(x).reshape(B, T, N, 3, self.num_heads, C // self.num_heads).permute(3, 0, 4, 1, 2, 5)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, T, N, head_dim)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(2, 3).reshape(B, T, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class SpatioTemporalFocalModulation(nn.Module):
     def __init__(self, dim, focal_window, focal_level, focal_factor=2, bias=True, proj_drop=0.,
-                use_postln_in_modulation=False, normalize_modulator=False, num_frames=8):
+                 use_postln_in_modulation=False, normalize_modulator=False, num_frames=8, num_heads=8):
         super().__init__()
 
         self.dim = dim
@@ -49,38 +79,28 @@ class SpatioTemporalFocalModulation(nn.Module):
         self.normalize_modulator = normalize_modulator
         self.num_frames = num_frames
 
-        self.f = nn.Linear(dim, 2*dim + (self.focal_level+1), bias=bias)
+        # Focalisation spatiale (existante)
+        self.f = nn.Linear(dim, 2 * dim + (self.focal_level + 1), bias=bias)
         self.h = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=bias)
-
         self.act = nn.GELU()
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.focal_layers = nn.ModuleList()
 
-        self.f_temporal = nn.Linear(dim, dim + (self.focal_level+1), bias=bias)
-        self.h_temporal = nn.Conv1d(dim, dim, kernel_size=1, stride=1, bias=bias)
-        self.focal_layers_temporal = nn.ModuleList()
-                
+        # Convolutions spatiales multi-niveaux (existantes)
         self.kernel_sizes = []
         for k in range(self.focal_level):
-            kernel_size = self.focal_factor*k + self.focal_window
+            kernel_size = self.focal_factor * k + self.focal_window
             self.focal_layers.append(
                 nn.Sequential(
-                    nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, 
-                    groups=dim, padding=kernel_size//2, bias=False),
+                    nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, groups=dim, padding=kernel_size // 2, bias=False),
                     nn.GELU(),
-                    )
                 )
+            )
             self.kernel_sizes.append(kernel_size)
-        
-        for k in range(self.focal_level):
-            kernel_size = self.focal_factor*k + self.focal_window
-            self.focal_layers_temporal.append(
-                nn.Sequential(
-                    nn.Conv1d(dim, dim, kernel_size=kernel_size, stride=1,
-                    padding=kernel_size//2, bias=False), nn.GELU(),
-                    )
-                )
+
+        # Cross-Frame Attention ajouté ici
+        self.cross_frame_attn = CrossFrameAttention(dim, num_heads=num_heads)
 
         if self.use_postln_in_modulation:
             self.ln = nn.LayerNorm(dim)
@@ -88,59 +108,53 @@ class SpatioTemporalFocalModulation(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: input features with shape of (B, H, W, C)
+            x: input features with shape of (B, T, H, W, C)
+            B: Batch size, T: Temporal dimension, H: Height, W: Width, C: Channels
         """
-        B, H, W, C = x.shape
+        B, T, H, W, C = x.shape
 
-        # pre linear projection temporal
-        x_temporal = torch.clone(x)
-        x_temporal = rearrange(x_temporal, '(b t) h w c -> (b h w) t c', t=self.num_frames, h=H, w=W)
-        x_temporal = self.f_temporal(x_temporal).permute(0, 2, 1).contiguous()
-        ctx_temporal, self.gates_temporal = torch.split(x_temporal, (C, self.focal_level+1), 1)
+        # Réorganisation des frames pour traitement global
+        x = rearrange(x, 'b t h w c -> (b h w) t c')
 
-        # context aggregration temporal
-        ctx_all_temporal = 0 
-        for l in range(self.focal_level):
-            ctx_temporal = self.focal_layers_temporal[l](ctx_temporal)
-            ctx_all_temporal = ctx_all_temporal + ctx_temporal*self.gates_temporal[:, l:l+1]
-        ctx_global_temporal = self.act(ctx_temporal.mean(2, keepdim=True))
-        ctx_all_temporal = ctx_all_temporal + ctx_global_temporal*self.gates_temporal[:,self.focal_level:]
+        # Focalisation spatiale
+        x = self.f(x)
+        q, ctx, self.gates = torch.split(x, (C, C, self.focal_level + 1), -1)
 
-        # pre linear projection spatial
-        x = self.f(x).permute(0, 3, 1, 2).contiguous()
-        q, ctx, self.gates = torch.split(x, (C, C, self.focal_level+1), 1)
+        # Cross-Frame Attention
+        x = self.cross_frame_attn(q)
         
-        # context aggreation spatial
+        # Revenir à la disposition d'origine pour la modulation spatiale
+        x = rearrange(x, '(b h w) t c -> b t h w c', h=H, w=W)
+        ctx = rearrange(ctx, '(b h w) t c -> b t h w c', h=H, w=W)
+        self.gates = rearrange(self.gates, '(b h w) t c -> b t h w c', h=H, w=W)
+
+        # Agrégation contextuelle spatiale
         ctx_all = 0
-        for l in range(self.focal_level):         
+        for l in range(self.focal_level):
+            ctx = rearrange(ctx, 'b t h w c -> (b t) c h w')
             ctx = self.focal_layers[l](ctx)
-            ctx_all = ctx_all + ctx*self.gates[:, l:l+1]
+            ctx = rearrange(ctx, '(b t) c h w -> b t h w c', t=T)
+            ctx_all = ctx_all + ctx * self.gates[:, :, :, :, l:l + 1]
         ctx_global = self.act(ctx.mean(2, keepdim=True).mean(3, keepdim=True))
-        ctx_all = ctx_all + ctx_global*self.gates[:,self.focal_level:]
+        ctx_all = ctx_all + ctx_global * self.gates[:, :, :, :, self.focal_level:]
 
-        # normalize context
-        if self.normalize_modulator:
-            ctx_all_temporal = ctx_all_temporal / (self.focal_level+1)
-            ctx_all = ctx_all / (self.focal_level+1)
+        # Modulation spatiale
+        self.modulator = self.h(ctx_all.view(-1, C, H, W))
 
-        # focal modulation
-        self.modulator_temporal = self.h_temporal(ctx_all_temporal)
-        self.modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) c h w', t=self.num_frames, h=H, w=W)
+        # Application de la modulation sur q
+        x = rearrange(q, '(b h w) t c -> b t h w c', h=H, w=W)
+        x = rearrange(x * self.modulator.view(B, 1, C, H, W), 'b t c h w -> (b t) h w c')
 
-        self.modulator = self.h(ctx_all)
-
-        x_out = q*self.modulator*self.modulator_temporal
-        x_out = x_out.permute(0, 2, 3, 1).contiguous()
+        # Post-projection
         if self.use_postln_in_modulation:
-            x_out = self.ln(x_out)
-        
-        # post linear porjection
-        x_out = self.proj(x_out)
-        x_out = self.proj_drop(x_out)
-        return x_out
+            x = self.ln(x)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}'
+
 
 class VideoFocalNetBlock(nn.Module):
     r""" Focal Modulation Network Block.
@@ -431,7 +445,7 @@ class VideoFocalNet(nn.Module):
                 use_postln_in_modulation=False, 
                 normalize_modulator=False,
                 num_frames=8,
-                tubelet_size=1,
+                tubelet_size=2,
                 **kwargs):
         super().__init__()
 
@@ -443,7 +457,7 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = [num_frame//self.tubelet_size for num_frame in num_frames]
+        self.num_frames = num_frames//self.tubelet_size
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -486,7 +500,7 @@ class VideoFocalNet(nn.Module):
                                use_postln=use_postln,
                                use_postln_in_modulation=use_postln_in_modulation, 
                                normalize_modulator=normalize_modulator,
-                               num_frames=self.num_frames[i_layer]
+                               num_frames=self.num_frames
                     )
             self.layers.append(layer)
 
@@ -516,34 +530,12 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
-        for idx, layer in enumerate (self.layers):
+
+        for layer in self.layers:
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
-                pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
-                curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
-                
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        
         return x
 
     def forward(self, x):
@@ -552,7 +544,7 @@ class VideoFocalNet(nn.Module):
             x =  x.reshape(-1,c,h,w)
         x = self.forward_features(x)
         # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames[-1], x.shape[-1])
+        x = x.view(b, self.num_frames, x.shape[-1])
         x = x.mean(dim=1)
         x = self.head(x)
         return x

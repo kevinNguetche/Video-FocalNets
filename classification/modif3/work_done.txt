@@ -1,0 +1,7 @@
+Ajout de la normalisation avant les convolutions spatiales :
+
+    J'ai ajouté une nouvelle couche LayerNorm nommée self.pre_conv_norm, appliquée juste après l'attention croisée (Cross-Frame Attention) et avant les convolutions spatiales. Cela permet de stabiliser le flux de gradients en normalisant les données avant qu'elles ne passent par les convolutions.
+
+Placement de la normalisation :
+
+    La normalisation est placée après l'attention croisée (CrossFrameAttention) et avant les opérations de modulation spatiale pour s'assurer que les activations sont bien conditionnées avant les convolutions profondes.

@@ -1,0 +1,15 @@
+Réorganisation des frames avant le traitement global :
+
+    Le tenseur d'entrée x est réorganisé de (B, T, H, W, C) à (B * H * W, T, C) avant d'entrer dans la focalisation spatiale et l'attention croisée (CrossFrameAttention). Cela permet un traitement plus global des frames avant la modulation spatiale.
+
+Cross-Frame Attention :
+
+    L'attention croisée (CrossFrameAttention) est appliquée directement sur les frames réorganisées, ce qui permet de capturer les relations entre les frames plus efficacement.
+
+Retour à la disposition d'origine :
+
+    Après l'attention, les données sont réorganisées à leur forme d'origine (B, T, H, W, C) pour la modulation spatiale.
+
+Modulation spatiale améliorée :
+
+    La modulation spatiale est appliquée après avoir reformé les tenseurs et effectué les calculs contextuels (ctx) pour chaque frame, réduisant ainsi la complexité des réorganisations après chaque étape.

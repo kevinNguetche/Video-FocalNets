@@ -20,7 +20,6 @@ _C.BASE = ['']
 # -----------------------------------------------------------------------------
 _C.DATA = CN()
 # Batch size for a single GPU, could be overwritten by command line argument
-_C.DATA.PREFIX = ''
 _C.DATA.ROOT = '/PATH/TO/videos'
 _C.DATA.TRAIN_FILE = '/PATH/TO/train.txt'
 _C.DATA.VAL_FILE = '/PATH/TO/val.txt'
@@ -106,7 +105,7 @@ _C.TRAIN.CLIP_GRAD = 5.0
 _C.TRAIN.AUTO_RESUME = True
 # Gradient accumulation steps
 # could be overwritten by command line argument
-_C.TRAIN.ACCUMULATION_STEPS = 16
+_C.TRAIN.ACCUMULATION_STEPS = 4
 # Whether to use gradient checkpointing to save memory
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
@@ -236,8 +235,8 @@ def update_config(config, args):
         config.TRAIN.ACCUMULATION_STEPS = args.accumulation_steps
     if args.use_checkpoint:
         config.TRAIN.USE_CHECKPOINT = True
-    #if args.amp_opt_level:
-    #    config.AMP_OPT_LEVEL = args.amp_opt_level
+    if args.amp_opt_level:
+        config.AMP_OPT_LEVEL = args.amp_opt_level
     if args.output:
         config.OUTPUT = args.output
     if args.eval:

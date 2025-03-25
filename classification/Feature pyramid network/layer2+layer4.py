@@ -17,6 +17,8 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
 from timm.data.transforms import str_to_pil_interp
 from einops import rearrange
+import math
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -302,12 +304,15 @@ class BasicLayer(nn.Module):
             else:
                 x = blk(x)
 
+        # Capture x before downsampling
+        x_out = x  # [B, L, dim]
 
         if self.downsample is not None:
             x = x.transpose(1, 2).reshape(x.shape[0], -1, H, W)
             x, Ho, Wo = self.downsample(x)
         else:
             Ho, Wo = H, W
+
         return x, Ho, Wo
 
     def extra_repr(self) -> str:
@@ -443,7 +448,8 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = [num_frame//self.tubelet_size for num_frame in num_frames]
+        self.num_frames = num_frames//self.tubelet_size
+        
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -486,14 +492,21 @@ class VideoFocalNet(nn.Module):
                                use_postln=use_postln,
                                use_postln_in_modulation=use_postln_in_modulation, 
                                normalize_modulator=normalize_modulator,
-                               num_frames=self.num_frames[i_layer]
+                               num_frames=self.num_frames
                     )
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        
+        # Defining lateral layers for channel alignment
+        self.fuse_dim = embed_dim[1]  # Use the fix size
+        self.lateral_layer2 = nn.Linear(embed_dim[2], self.fuse_dim)
+        self.lateral_layer4 = nn.Linear(embed_dim[3], self.fuse_dim)
+        self.fuse_smooth = nn.Conv2d(self.fuse_dim, self.fuse_dim, kernel_size=3, stride=1, padding=1)
 
+        self.head = nn.Linear(self.num_features + self.fuse_dim, num_classes) if num_classes > 0 else nn.Identity()
+        
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -508,7 +521,7 @@ class VideoFocalNet(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {''}
-
+    
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {''}
@@ -516,46 +529,63 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-        
-        num_layers = len (self.layers)
-        
-        for idx, layer in enumerate (self.layers):
-            x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
-                B, L, C = x.shape
-                pred_t = self.num_frames[idx - 1]
-                
-                batch_size = B // pred_t
-                
-                x = x.view(batch_size , pred_t, L, C)
-                
-                curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
-                
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
-                B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
-                
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
+
+        output_stage2 = None
+        output_stage4 = None
+        H2 = W2 = H4 = W4 = None
+
+        for idx, layer in enumerate(self.layers):
+            x, H, W = layer(x, H, W)  # Updated to receive x_out
+            if idx == 1:  # Second stage (indexing starts from 0)
+                output_stage2 = x
+                H2, W2 = H, W
+            if idx == 3:  # Fourth stage
+                output_stage4 = x
+                H4, W4 = H, W
+
+        x = self.norm(x)  # Final normalization
+        x = self.avgpool(x.transpose(1, 2))  # Pooling
         x = torch.flatten(x, 1)
-        
-        return x
+        return x, output_stage2, H2, W2, output_stage4, H4, W4
 
     def forward(self, x):
-        b,t,c,h,w = x.size()
-        if self.tubelet_size==1:
-            x =  x.reshape(-1,c,h,w)
-        x = self.forward_features(x)
-        # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames[-1], x.shape[-1])
+        b, t, c, h, w = x.size()
+        if self.tubelet_size == 1:
+            x = x.reshape(-1, c, h, w)
+
+        x, output_stage2, H2, W2, output_stage4, H4, W4 = self.forward_features(x)
+        B = x.shape[0]  # Batch size
+
+        # Check if outputs are captured
+        if output_stage2 is not None and output_stage4 is not None:
+            # Project outputs to the same channel dimension
+            output_stage2 = self.lateral_layer2(output_stage2)  # [B, L2, fuse_dim]
+            output_stage4 = self.lateral_layer4(output_stage4)  # [B, L4, fuse_dim]
+            
+            output_stage2 = output_stage2.transpose(1, 2).view(B, self.fuse_dim, H2, W2)
+            output_stage4 = output_stage4.transpose(1, 2).view(B, self.fuse_dim, H4, W4)
+
+            # Upsample output_stage4 to match spatial dimensions of output_stage2
+            output_stage4_upsampled = F.interpolate(output_stage4, size=(H2, W2), mode='bilinear', align_corners=False)
+
+            # Fuse the outputs (addition)
+            fused_output = output_stage2 + output_stage4_upsampled
+
+            # Apply smoothing
+            fused_output = self.fuse_smooth(fused_output)
+
+            # Global average pooling to get feature vector
+            fused_output = fused_output.view(B, self.fuse_dim, -1).mean(dim=2)  # [B, fuse_dim]
+
+            # Concatenate with the final feature vector x
+            x = torch.cat([x, fused_output], dim=1)  # [B, num_features + fuse_dim]
+
+        # Reshape for temporal processing
+        x = x.view(b, self.num_frames, x.shape[-1])
         x = x.mean(dim=1)
         x = self.head(x)
         return x
+
 
 
 def build_transforms(img_size, center_crop=False):

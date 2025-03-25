@@ -512,40 +512,43 @@ class VideoFocalNet(nn.Module):
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {''}
-
+	
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
         
-        num_layers = len (self.layers)
+        num_layers = len(self.layers)
         
-        for idx, layer in enumerate (self.layers):
+        for idx, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
-            if ( idx != 0 and idx < num_layers ) :
-                #print("Start Stage N°" , idx)               
+            
+            if (idx != 0 and idx < num_layers):
+                # Reshape to [batch_size, pred_t, L, C]
                 B, L, C = x.shape
                 pred_t = self.num_frames[idx - 1]
-                
                 batch_size = B // pred_t
                 
-                x = x.view(batch_size , pred_t, L, C)
+                x = x.view(batch_size, pred_t, L, C)
                 
+                # Average Pooling for temporal subsampling
                 curr_t = self.num_frames[idx]
-                subsample = pred_t // curr_t 
+                subsample = pred_t // curr_t
                 
-                x = x[:, ::subsample, :,:]
-                
-                #print("New x.shape " , x.shape)
-                
+                if subsample > 1:
+                    x = x.permute(0, 3, 2, 1)  # [batch_size, C, L, pred_t]
+                    x = F.avg_pool2d(x, kernel_size=(1, subsample), stride=(1, subsample))
+                    x = x.permute(0, 3, 2, 1)  # [batch_size, pred_t_new, L, C]
+
+                # Flatten back to [B_new * T_new, L_new, C_new]
                 B_new, T_new, L_new, C_new = x.shape
-                x = x.view (B_new * T_new , L_new, C_new)
+                x = x.view(B_new * T_new, L_new, C_new)
                 
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
         
         return x
-
+	
     def forward(self, x):
         b,t,c,h,w = x.size()
         if self.tubelet_size==1:
