@@ -63,15 +63,16 @@ def parse_option():
     
     config = get_config(args)
     
-    config.PREFIX = args.prefix
+    #config.PREFIX = args.prefix
     
     return args, config
 
 
 def main(config):
-
+		
     # dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
-    dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config, config.PREFIX)
+    #dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config, config.PREFIX)
+    dataset_train, dataset_val, data_loader_train, data_loader_val = build_dataloader(logger, config)
 	
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     

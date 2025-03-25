@@ -20,7 +20,7 @@ _C.BASE = ['']
 # -----------------------------------------------------------------------------
 _C.DATA = CN()
 # Batch size for a single GPU, could be overwritten by command line argument
-_C.DATA.PREFIX = ''
+_C.DATA.PREFIX = '/PATH/TO/videos'
 _C.DATA.ROOT = '/PATH/TO/videos'
 _C.DATA.TRAIN_FILE = '/PATH/TO/train.txt'
 _C.DATA.VAL_FILE = '/PATH/TO/val.txt'
