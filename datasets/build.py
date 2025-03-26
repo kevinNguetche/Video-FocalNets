@@ -262,7 +262,7 @@ def mmcv_collate(batch, samples_per_gpu=1):
 
 def build_dataloader(logger, config):
     scale_resize = int(256 / 224 * config.DATA.INPUT_SIZE)
-    prefix = config.PREFIX
+    prefix = config.DATA.PREFIX
     train_pipeline = [
         dict(type='DecordInit'),
         dict(type='SampleFrames', clip_len=1, frame_interval=config.AUG.FRAME_INTERVAL, num_clips=config.DATA.NUM_FRAMES[0]),

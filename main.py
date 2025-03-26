@@ -50,7 +50,6 @@ def parse_option():
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder')
                         
-    parser.add_argument('--prefix', type=str, help='Prefix path for dataset')
     
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
 
@@ -63,7 +62,6 @@ def parse_option():
     
     config = get_config(args)
     
-    #config.PREFIX = args.prefix
     
     return args, config
 
@@ -181,7 +179,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
     
-    scaler = torch.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler()
     grad_norm = 0.0
     
     start = time.time()
