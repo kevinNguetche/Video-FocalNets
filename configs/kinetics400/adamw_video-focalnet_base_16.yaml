@@ -22,7 +22,7 @@ TRAIN:
   BASE_LR: 5e-4
   WARMUP_LR: 5e-7
   MIN_LR: 5e-6
-  EPOCHS: 120
+  EPOCHS: 51
   WEIGHT_DECAY: 0.05
   OPTIMIZER:
     NAME: "adamw"
