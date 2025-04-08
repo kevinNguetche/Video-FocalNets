@@ -18,6 +18,69 @@ from timm.data import create_transform
 from timm.data.transforms import str_to_pil_interp
 from einops import rearrange
 
+from scipy.optimize import linear_sum_assignment
+
+
+def sinkhorn(cost_matrix, epsilon=0.1, max_iter=50, device='cuda'):
+    # Initialize variables
+    n = cost_matrix.size(0)
+    mu = torch.full((n,), 1.0 / n, device=device)  # [HW]
+    nu = torch.full((n,), 1.0 / n, device=device)  # [HW]
+
+    # Compute the kernel matrix K = exp(-cost / epsilon)
+    K = torch.exp(-cost_matrix / epsilon)  # [HW, HW]
+
+    # Initialize u and v
+    u = torch.ones_like(mu, device=device)  # [HW]
+    v = torch.ones_like(nu, device=device)  # [HW]
+
+    # Sinkhorn iterations
+    for _ in range(max_iter):
+        u = mu / (K @ v)
+        v = nu / (K.t() @ u)
+    
+    # Compute the transport plan: T = diag(u) * K * diag(v)
+    transport_plan = torch.diag(u) @ K @ torch.diag(v)  # [HW, HW]
+    return transport_plan
+
+
+def Align(x, epsilon=0.1, max_iter=50):
+    dealignment = []
+    T, H, W, C = x.shape
+    device = x.device
+    x = x.reshape(T, H * W, C)  # [T, HW, C]
+    for ti in range(1, T):
+        prev = torch.nn.functional.normalize(x[ti - 1], dim=-1).detach()  # [HW, C]
+        curr = torch.nn.functional.normalize(x[ti], dim=-1).detach()      # [HW, C]
+        similarity = prev @ curr.t()  # [HW, HW]
+
+        # Compute the cost matrix (negative similarity)
+        cost = -similarity  # [HW, HW]
+
+        # Apply Sinkhorn algorithm to obtain the transport plan
+        alignment = sinkhorn(cost, epsilon=epsilon, max_iter=max_iter, device=device)  # [HW, HW]
+
+        dealignment.append(alignment.t())  # Store the transport plan for dealignment
+
+        # Apply the transport plan to align the features
+        x[ti] = alignment @ x[ti]  # [HW, C]
+
+    dealignment = torch.stack(dealignment)  # [T-1, HW, HW]
+    x = x.reshape(T, H, W, C)  # [T, H, W, C]
+    return x, dealignment
+
+
+def Dealign(x, dealignment):
+    T, H, W, C = x.shape
+    x = x.reshape(T, H * W, C)  # [T, HW, C]
+    for ti in range(1, T):
+        # Use the stored transport plan to reverse the alignment
+        x[ti] = dealignment[ti - 1] @ x[ti]  # [HW, C]
+    x = x.reshape(T, H, W, C)  # [T, H, W, C]
+    return x
+
+
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -81,7 +144,7 @@ class SpatioTemporalFocalModulation(nn.Module):
                     padding=kernel_size//2, bias=False), nn.GELU(),
                     )
                 )
-
+	
         if self.use_postln_in_modulation:
             self.ln = nn.LayerNorm(dim)
 
@@ -91,13 +154,14 @@ class SpatioTemporalFocalModulation(nn.Module):
             x: input features with shape of (B, H, W, C)
         """
         B, H, W, C = x.shape
-
+	
         # pre linear projection temporal
         x_temporal = torch.clone(x)
+        x_temporal, dealignment = Align(x_temporal)
         x_temporal = rearrange(x_temporal, '(b t) h w c -> (b h w) t c', t=self.num_frames, h=H, w=W)
         x_temporal = self.f_temporal(x_temporal).permute(0, 2, 1).contiguous()
         ctx_temporal, self.gates_temporal = torch.split(x_temporal, (C, self.focal_level+1), 1)
-
+        
         # context aggregration temporal
         ctx_all_temporal = 0 
         for l in range(self.focal_level):
@@ -122,13 +186,17 @@ class SpatioTemporalFocalModulation(nn.Module):
         if self.normalize_modulator:
             ctx_all_temporal = ctx_all_temporal / (self.focal_level+1)
             ctx_all = ctx_all / (self.focal_level+1)
-
+        
         # focal modulation
         self.modulator_temporal = self.h_temporal(ctx_all_temporal)
-        self.modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) c h w', t=self.num_frames, h=H, w=W)
-
+        
+        opti_modulator_temporal = rearrange(self.modulator_temporal, '(b h w) c t -> (b t) h w c', t=self.num_frames, h=H, w=W)
+        old_temporal = Dealign(opti_modulator_temporal, dealignment)
+        
+        self.modulator_temporal = rearrange(old_temporal, '(b t) h w c -> (b t) c h w', t=self.num_frames, h=H, w=W)
+	
         self.modulator = self.h(ctx_all)
-
+	
         x_out = q*self.modulator*self.modulator_temporal
         x_out = x_out.permute(0, 2, 3, 1).contiguous()
         if self.use_postln_in_modulation:

@@ -26,10 +26,11 @@ from thop import profile, clever_format
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+
 def parse_option():
     parser = argparse.ArgumentParser('FocalNet training and evaluation script', add_help=False)
     parser.add_argument('--cfg', type=str, required=False, metavar="FILE", help='path to config file',
-                        default='./configs/hmdb51/video-focalnet_base.yaml')
+                        default='./configs/kinetics400/video-focalnet_base.yaml')
     parser.add_argument(
         "--opts",
         help="Modify config options by adding 'KEY VALUE' pairs. ",
@@ -57,10 +58,9 @@ def parse_option():
     return args, config
 
 
-
 _, config = parse_option()
 config.defrost()
-config.DATA.NUM_FRAMES = [8,8,8,8]
+config.DATA.NUM_FRAMES = 8
 config.freeze()
 model = build_model(config)
 model = model.to(device)

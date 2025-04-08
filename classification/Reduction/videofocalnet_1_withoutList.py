@@ -443,7 +443,7 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = num_frames//self.tubelet_size
+        self.num_frames = num_frames
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -465,8 +465,11 @@ class VideoFocalNet(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
         # build layers
+        numFrames = self.num_frames
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
+            if i_layer == 1 :
+                self.num_frames = self.num_frames // 2
             layer = BasicLayer(dim=embed_dim[i_layer], 
                                out_dim=embed_dim[i_layer+1] if (i_layer < self.num_layers - 1) else None,  
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
@@ -489,7 +492,8 @@ class VideoFocalNet(nn.Module):
                                num_frames=self.num_frames
                     )
             self.layers.append(layer)
-
+            
+        self.num_frames = numFrames
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
@@ -516,23 +520,54 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-
-        for layer in self.layers:
+                
+        for idx, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
+            print("Debut Stage N° :", idx, "shape de x :", x.shape)
+            if idx == 1:
+                # Reshape x to (B, T, L, C)
+                B_times_T, L, C = x.shape
+                B = B_times_T // self.num_frames
+                T = self.num_frames
+                x = x.view(B, T, L, C)
+                
+                # Sliding window downsampling: take every second frame
+                x = x[:, ::2, :, :]  # Reduces T by half by selecting every 2nd frame
+                
+                # Reverse the operations to flatten the temporal dimension
+                T_reduced = x.shape[1]  # Now T_reduced = T // 2
+                x = x.view(B * T_reduced, L, C)
+                
+                print("T_reduced :", T_reduced)
+                print("self.num_frames :", self.num_frames)
+            print("Fin Stage N° :", idx, "shape de x :", x.shape)
+
         x = self.norm(x)  # B L C
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
+        
         return x
 
     def forward(self, x):
-        b,t,c,h,w = x.size()
-        if self.tubelet_size==1:
-            x =  x.reshape(-1,c,h,w)
+        b, t, c, h, w = x.size()
+        if self.tubelet_size == 1:
+            x = x.reshape(-1, c, h, w)
+        
+        # Pass through forward_features without relying on a dynamically updated num_frames
         x = self.forward_features(x)
-        # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames, x.shape[-1])
+        
+        # Calculate num_frames based on the shape of x and b
+        num_frames = x.shape[0] // b
+        
+        print("num_frames before forward_feature", t)
+        print("num_frames after forward_feature", num_frames)
+        # Use the calculated num_frames for reshaping
+        x = x.view(b, num_frames, x.shape[-1])
+        
+        # Aggregate over the temporal dimension
         x = x.mean(dim=1)
         x = self.head(x)
+        
         return x
 
 

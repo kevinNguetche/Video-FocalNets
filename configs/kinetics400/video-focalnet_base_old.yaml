@@ -1,7 +1,7 @@
 DATA:
     ROOT: ''
-    TRAIN_FILE: 'datasets/train_k400_s.csv'
-    VAL_FILE: 'datasets/val_k400_s.csv'
+    TRAIN_FILE: '../datasets/kinetics-dataset/k400_resized_1/annotations_svt/train.csv'
+    VAL_FILE: '../datasets/kinetics-dataset/k400_resized_1/annotations_svt/val.csv'
     DATASET: kinetics400
     NUM_FRAMES: 8
     NUM_CLASSES: 400
@@ -27,7 +27,7 @@ TRAIN:
   OPTIMIZER:
     NAME: "sgd"
   WARMUP_EPOCHS: 20
-  PRETRAINED_PATH: 'focalnet_base_srf.pth'
+  PRETRAINED_PATH: './pretrained/focalnet_base_srf.pth'
 AUG:
   FRAME_INTERVAL: 4
   FLIP_RATIO: 0.5
@@ -35,4 +35,4 @@ AUG:
   GRAY_SCALE: 0.2
   MIXUP: 0.8
   MIXUP_PROB: 0.5
-SAVE_FREQ: 5
+SAVE_FREQ: 10

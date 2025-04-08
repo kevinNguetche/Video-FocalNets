@@ -384,7 +384,34 @@ class PatchEmbed(nn.Module):
                 x = self.norm(x)
             return x, H, W
 
-
+class TemporalDownsample(nn.Module):
+    def __init__(self, channels, kernel_size=2, stride=2, reduction=16):
+        super(TemporalDownsample, self).__init__()
+        self.pool = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)
+        self.proj = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True)
+        )
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(channels // reduction, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        # x: [B*L, C, T]
+        x_pooled = self.pool(x)  # [B*L, C, T_reduced]
+        x_proj = self.proj(x_pooled)  # [B*L, C, T_reduced]
+        
+        # Calculer l'attention
+        attn = self.attention(x_proj)  # [B*L, C, 1]
+        attn = attn.expand_as(x_proj)   # [B*L, C, T_reduced]
+        x = x_proj * attn               # [B*L, C, T_reduced]
+        
+        return x
 
 class VideoFocalNet(nn.Module):
     r"""Spatio Temporal Focal Modulation Networks (Video-FocalNets)
@@ -443,7 +470,7 @@ class VideoFocalNet(nn.Module):
         self.num_features = embed_dim[-1]
         self.mlp_ratio = mlp_ratio
         self.tubelet_size=tubelet_size
-        self.num_frames = num_frames//self.tubelet_size
+        self.num_frames = num_frames
         
         # split image into patches using either non-overlapped embedding or overlapped embedding
         self.patch_embed = PatchEmbed(
@@ -465,8 +492,11 @@ class VideoFocalNet(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
         # build layers
+        numFrames = self.num_frames
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
+            if i_layer == 1 :
+                self.num_frames = self.num_frames // 2
             layer = BasicLayer(dim=embed_dim[i_layer], 
                                out_dim=embed_dim[i_layer+1] if (i_layer < self.num_layers - 1) else None,  
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
@@ -489,12 +519,25 @@ class VideoFocalNet(nn.Module):
                                num_frames=self.num_frames
                     )
             self.layers.append(layer)
-
+        
+        self.num_frames = numFrames
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
+        # Initialiser la couche de downsampling temporel avec AvgPool1d
+        if 1 < self.num_layers:
+            temporal_embed_dim = embed_dim[2]  # Nombre de canaux à la layer idx==1
+            self.temporal_downsample = TemporalDownsample(
+                channels=temporal_embed_dim,
+                kernel_size=2,
+                stride=2
+            )
+        else:
+            self.temporal_downsample = None
+        
         self.apply(self._init_weights)
+
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -516,23 +559,64 @@ class VideoFocalNet(nn.Module):
     def forward_features(self, x):
         x, H, W = self.patch_embed(x)
         x = self.pos_drop(x)
-
-        for layer in self.layers:
+                
+        for idx, layer in enumerate(self.layers):
             x, H, W = layer(x, H, W)
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
+            print("Début Stage N° :", idx, "shape de x :", x.shape)
+            if idx == 1 and self.temporal_downsample is not None:
+                # Reshape x to (B, T, L, C)
+                B_times_T, L, C = x.shape
+                B = B_times_T // self.num_frames
+                T = self.num_frames
+                x = x.view(B, T, L, C)
+                
+                # Réarranger pour Conv1d : (B * L, C, T)
+                x = rearrange(x, 'b t l c -> (b l) c t')  # [B*L, C, T]
+                
+                # Appliquer l'AvgPool1d + Projection
+                x = self.temporal_downsample(x)  # [B*L, C, T_reduced]
+                
+                # Réarranger de nouveau : (B, T_reduced, L, C)
+                x = rearrange(x, '(b l) c t -> b t l c', b=B, l=L)  # [B, T_reduced, L, C]
+                
+                # Revert to (B * T_reduced, L, C)
+                B, T_reduced, L, C = x.shape
+                x = x.view(B * T_reduced, L, C)  # [B*T_reduced, L, C]
+                
+                print("T_reduced :", T_reduced)
+                print("self.num_frames :", self.num_frames)
+                
+                # Mettre à jour num_frames pour les étapes suivantes si nécessaire
+                self.num_frames = T_reduced
+            print("Fin Stage N° :", idx, "shape de x :", x.shape)
+
+        x = self.norm(x)  # [B*T_reduced, L, C]
+        x = self.avgpool(x.transpose(1, 2))  # [B*T_reduced, C, 1]
+        x = torch.flatten(x, 1)  # [B*T_reduced, C]
+        
         return x
 
+
     def forward(self, x):
-        b,t,c,h,w = x.size()
-        if self.tubelet_size==1:
-            x =  x.reshape(-1,c,h,w)
+        b, t, c, h, w = x.size()
+        if self.tubelet_size == 1:
+            x = x.reshape(-1, c, h, w)
+        
+        # Pass through forward_features without relying on a dynamically updated num_frames
         x = self.forward_features(x)
-        # Here just aggregate the corresponding frames of same video BxT, C
-        x = x.view(b, self.num_frames, x.shape[-1])
+        
+        # Calculate num_frames based on the shape of x and b
+        num_frames = x.shape[0] // b
+        
+        print("num_frames before forward_feature", t)
+        print("num_frames after forward_feature", num_frames)
+        # Use the calculated num_frames for reshaping
+        x = x.view(b, num_frames, x.shape[-1])
+        
+        # Aggregate over the temporal dimension
         x = x.mean(dim=1)
         x = self.head(x)
+        
         return x
 
 

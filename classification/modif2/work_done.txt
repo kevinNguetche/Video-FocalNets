@@ -1,2 +1,0 @@
-Depthwise convolution : La première convolution dans chaque focal_layer utilise des convolutions depth-wise, où chaque canal est convolé séparément avec le filtre, réduisant ainsi le coût en termes de calcul.
-Pointwise convolution : Ensuite, une convolution classique avec un kernel de taille 1x1 est utilisée pour rétablir les interactions inter-canaux.

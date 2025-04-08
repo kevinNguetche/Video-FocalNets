@@ -41,10 +41,11 @@ def update_video_paths(input_csv_path, output_csv_path, old_path, new_path):
 
 # Example usage
 if __name__ == "__main__":
-    input_csv = "old_val_kinetics400.csv"
-    output_csv = "val_kinetics400.csv"
-    old_path = "/"
-    new_path = "/home/ens/Knguetche/kinetics_resized/k400/val/"
-
+    #update_train_kinetics400 ; val_kinetics400 ; train_tiny
+    input_csv = "val_hmdb51.csv"
+    output_csv = "s_val_hmdb51.csv"
+    old_path = "/home/ens/Knguetche/hmdb51_video/"
+    new_path = "/storage/Knguetche/hmdb51_video/"
+	
     update_video_paths(input_csv, output_csv, old_path, new_path)
 

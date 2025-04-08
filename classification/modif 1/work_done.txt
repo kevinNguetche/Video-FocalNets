@@ -1,3 +1,0 @@
-Cross-Frame Attention avant modélisation spatiale : L'attention croisée est maintenant effectuée avant la modulation spatiale, ce qui réduit le coût global en alignant les focalisations spatiales avec une meilleure attention entre les frames.
-
-Précalcul de ctx_global : Le contexte global est calculé avant les modulations spatiales, ce qui évite de recalculer ce contexte à chaque itération dans la boucle sur focal_layers.
