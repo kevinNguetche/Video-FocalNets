@@ -153,7 +153,7 @@ def main(config):
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
 
-        if epoch == (config.TRAIN.EPOCHS - 1) or epoch == 1 or epoch == 3 or epoch == 5 or epoch % 10 == 0 :
+        if epoch == (config.TRAIN.EPOCHS - 1) or epoch % 2 == 0 :
             acc1 = validate(config, data_loader_val, model)
                 
             logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
@@ -330,11 +330,11 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
-
+    
     # linear scale the learning rate according to total batch size, may not be optimal
-    linear_scaled_lr = config.TRAIN.BASE_LR * (config.DATA.BATCH_SIZE * dist.get_world_size() / 128.0) ** (0.5)
-    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * (config.DATA.BATCH_SIZE * dist.get_world_size() / 128.0) ** (0.5)
-    linear_scaled_min_lr = config.TRAIN.MIN_LR * (config.DATA.BATCH_SIZE * dist.get_world_size() / 128.0) ** (0.5)
+    linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     # gradient accumulation also need to scale the learning rate
     if config.TRAIN.ACCUMULATION_STEPS > 1:
         linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
