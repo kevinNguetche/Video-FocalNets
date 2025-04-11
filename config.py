@@ -20,6 +20,7 @@ _C.BASE = ['']
 # -----------------------------------------------------------------------------
 _C.DATA = CN()
 # Batch size for a single GPU, could be overwritten by command line argument
+_C.DATA.PREFIX = '/PATH/TO/videos'
 _C.DATA.ROOT = '/PATH/TO/videos'
 _C.DATA.TRAIN_FILE = '/PATH/TO/train.txt'
 _C.DATA.VAL_FILE = '/PATH/TO/val.txt'
@@ -44,7 +45,7 @@ _C.DATA.CACHE_MODE = 'part'
 # Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.
 _C.DATA.PIN_MEMORY = True
 # Number of data loading threads
-_C.DATA.NUM_WORKERS = 16
+_C.DATA.NUM_WORKERS = 8
 
 # -----------------------------------------------------------------------------
 # Model settings
@@ -105,7 +106,7 @@ _C.TRAIN.CLIP_GRAD = 5.0
 _C.TRAIN.AUTO_RESUME = True
 # Gradient accumulation steps
 # could be overwritten by command line argument
-_C.TRAIN.ACCUMULATION_STEPS = 8
+_C.TRAIN.ACCUMULATION_STEPS = 0
 # Whether to use gradient checkpointing to save memory
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
@@ -235,8 +236,8 @@ def update_config(config, args):
         config.TRAIN.ACCUMULATION_STEPS = args.accumulation_steps
     if args.use_checkpoint:
         config.TRAIN.USE_CHECKPOINT = True
-    #if args.amp_opt_level:
-    #    config.AMP_OPT_LEVEL = args.amp_opt_level
+    if args.amp_opt_level:
+        config.AMP_OPT_LEVEL = args.amp_opt_level
     if args.output:
         config.OUTPUT = args.output
     if args.eval:
