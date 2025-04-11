@@ -110,7 +110,6 @@ class TemporalFocalAttention(nn.Module):
         mask = mask.unsqueeze(0).unsqueeze(0)  # Shape (1, 1, seq_len, seq_len)
         return mask.bool()  # Return a boolean mask
 
-
 class SpatioTemporalFocalModulation(nn.Module):
     def __init__(self, dim, focal_window, focal_level, focal_factor=2, bias=True, proj_drop=0.,
                  use_postln_in_modulation=False, normalize_modulator=False, num_frames=8, num_heads=8):
@@ -124,7 +123,7 @@ class SpatioTemporalFocalModulation(nn.Module):
         self.normalize_modulator = normalize_modulator
         self.num_frames = num_frames
 
-        # Spatial Focalization
+        # Focalisation spatiale (existante)
         self.f = nn.Linear(dim, 2 * dim + (self.focal_level + 1), bias=bias)
         self.h = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=bias)
         self.act = nn.GELU()
@@ -132,7 +131,7 @@ class SpatioTemporalFocalModulation(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.focal_layers = nn.ModuleList()
 
-        # Multi-level Spatial Convolutions
+        # Convolutions spatiales multi-niveaux (existantes)
         self.kernel_sizes = []
         for k in range(self.focal_level):
             kernel_size = self.focal_factor * k + self.focal_window
@@ -154,11 +153,6 @@ class SpatioTemporalFocalModulation(nn.Module):
 
         # Mapping function φ to project spatial context to temporal feature space
         self.ctx_to_temp = nn.Linear(dim, dim)
-        nn.init.normal_(self.ctx_to_temp.weight, std=0.02)
-        nn.init.constant_(self.ctx_to_temp.bias, 0)
-
-        # Normalization layer for ctx_temp
-        self.ctx_norm = nn.LayerNorm(dim)
 
     def forward(self, x):
         """
@@ -168,13 +162,13 @@ class SpatioTemporalFocalModulation(nn.Module):
         B, H, W, C = x.shape
 
         # Prepare temporal features
-        x_tempAtt = x.view(B // self.num_frames, self.num_frames, H * W, C)  # Shape: (B', T, N, C)
+        x_tempAtt = x.view(B // self.num_frames, self.num_frames, H * W, C)  # (B', T, N, C)
 
-        # Spatial Focalization
+        # Focalisation spatiale
         x_f = self.f(x).permute(0, 3, 1, 2).contiguous()
-        q, ctx, self.gates = torch.split(x_f, (C, C, self.focal_level + 1), dim=1)
+        q, ctx, self.gates = torch.split(x_f, (C, C, self.focal_level + 1), 1)
 
-        # Spatial Context Aggregation
+        # Agrégation contextuelle spatiale
         ctx_all = 0
         for l in range(self.focal_level):
             ctx_l = self.focal_layers[l](ctx)
@@ -182,30 +176,24 @@ class SpatioTemporalFocalModulation(nn.Module):
         ctx_global = self.act(ctx.mean(2, keepdim=True).mean(3, keepdim=True))
         ctx_all += ctx_global * self.gates[:, self.focal_level:]
 
-        # Normalize ctx_all to prevent large values
-        #ctx_all = ctx_all / (self.focal_level + 1)
-
         # Map spatial context to temporal feature space
-        ctx_all_flat = ctx_all.view(B, C, H * W).permute(0, 2, 1).contiguous()  # Shape: (B, N, C)
-        ctx_temp = self.ctx_to_temp(ctx_all_flat)  # Shape: (B, N, C)
-        ctx_temp = self.act(ctx_temp)  # Apply activation
-        ctx_temp = self.ctx_norm(ctx_temp)  # Normalize ctx_temp
-        ctx_temp = ctx_temp.view(B // self.num_frames, self.num_frames, H * W, C)  # Shape: (B', T, N, C)
+        ctx_all_flat = ctx_all.view(B, C, H * W).permute(0, 2, 1).contiguous()  # (B, N, C)
+        ctx_temp = self.ctx_to_temp(ctx_all_flat)  # (B, N, C)
+        ctx_temp = ctx_temp.view(B // self.num_frames, self.num_frames, H * W, C)  # (B', T, N, C)
 
         # Modulate temporal features with mapped spatial context
         x_tempAtt = x_tempAtt * ctx_temp  # Element-wise multiplication
 
         # Temporal Attention
-        x_tempAtt = self.attention_layer(x_tempAtt)  # Shape: (B', T, N, C)
-        x_tempAtt = x_tempAtt.view(B, H * W, C)  # Reshape to (B, N, C)
-        x_tempAtt = x_tempAtt.permute(0, 2, 1).contiguous().view(B, C, H, W)  # Shape: (B, C, H, W)
+        x_tempAtt = self.attention_layer(x_tempAtt)  # (B', T, N, C)
+        x_tempAtt = x_tempAtt.view(B, H, W, C)  # Reshape back to (B, H, W, C)
 
-        # Spatial Modulation
+        # Modulation spatiale
         modulator = self.h(ctx_all)
 
-        # Late Fusion
-        x_out = q * modulator * x_tempAtt  # Element-wise multiplication
-        x_out = x_out.permute(0, 2, 3, 1).contiguous()  # Shape: (B, H, W, C)
+        # Fusion tardive
+        x_out = q * modulator * x_tempAtt.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        x_out = x_out.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
 
         if self.use_postln_in_modulation:
             x_out = self.ln(x_out)

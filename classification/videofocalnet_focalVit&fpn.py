@@ -153,20 +153,35 @@ class SpatioTemporalFocalAttention(nn.Module):
             x: input features with shape of (B, H, W, C)
         """
         B, H, W, C = x.shape
-        x = rearrange(x, '(b t) h w c -> b t (h w) c', t=self.num_frames, h=H, w=W)
+        x_tempAtt = torch.clone(x) 
+        x_tempAtt = rearrange(x_tempAtt, '(b t) h w c -> b t (h w) c', t=self.num_frames, h=H, w=W)
         
+        
+        x = self.f(x).permute(0, 3, 1, 2).contiguous()
+        q, ctx, self.gates = torch.split(x, (C, C, self.focal_level+1), 1)
+        
+        ctx_all = 0
+        for l in range(self.focal_level):
+            ctx = self.focal_layers[l](ctx)
+            ctx_all = ctx_all + ctx * self.gates[:, l:l + 1]
+        ctx_global = self.act(ctx.mean(2, keepdim=True).mean(3, keepdim=True))
+        ctx_all = ctx_all + ctx_global * self.gates[:, self.focal_level:]
+
         # Temporal Attention
-        x = self.attention_layer(x)
-        x = rearrange(x, 'b t (h w) c -> (b t) c h w', h=H, w=W)                
-        x = x.permute(0, 2, 3, 1).contiguous()
+        x_tempAtt = self.attention_layer(x_tempAtt)
+        x_tempAtt = rearrange(x_tempAtt, 'b t (h w) c -> (b t) c h w', h=H, w=W)
         
+        self.modulator = self.h(ctx_all)
+        
+        x_out = q*self.modulator*x_tempAtt
+        x_out = x_out.permute(0, 2, 3, 1).contiguous()
         if self.use_postln_in_modulation:
-            x = self.ln(x)
+            x_out = self.ln(x_out)
         
         # post linear porjection
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        return x_out
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}'
@@ -524,11 +539,9 @@ class VideoFocalNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         
         # Defining lateral layers for channel alignment
-        self.fuse_dim = embed_dim[1]  # Fixing fuse_dim
-        self.lateral_layer1 = nn.Linear(embed_dim[1], self.fuse_dim)  # For stage 1
-        self.lateral_layer2 = nn.Linear(embed_dim[2], self.fuse_dim)  # For stage 2
-        self.lateral_layer3 = nn.Linear(embed_dim[3], self.fuse_dim)  # For stage 3
-        self.lateral_layer4 = nn.Linear(embed_dim[3], self.fuse_dim)  # For stage 4
+        self.fuse_dim = embed_dim[1]  # Use the fix size
+        self.lateral_layer1 = nn.Linear(embed_dim[1], self.fuse_dim)
+        self.lateral_layer4 = nn.Linear(embed_dim[3], self.fuse_dim)
         self.fuse_smooth = nn.Conv2d(self.fuse_dim, self.fuse_dim, kernel_size=3, stride=1, padding=1)
         
         self.head = nn.Linear(self.num_features + self.fuse_dim, num_classes) if num_classes > 0 else nn.Identity()
@@ -543,7 +556,7 @@ class VideoFocalNet(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
+    
     @torch.jit.ignore
     def no_weight_decay(self):
         return {''}
@@ -557,60 +570,45 @@ class VideoFocalNet(nn.Module):
         x = self.pos_drop(x)
 
         output_stage1 = None
-        output_stage2 = None
-        output_stage3 = None
         output_stage4 = None
-        H1 = W1 = H2 = W2 = H3 = W3 = H4 = W4 = None
-
+        H1 = W1 = H4 = W4 = None
+        
         for idx, layer in enumerate(self.layers):
-            x, H, W = layer(x, H, W)  
-            if idx == 0:  # First stage
+            x, H, W = layer(x, H, W)  # Updated to receive x_out
+            if idx == 0:  # Second stage (indexing starts from 0)
                 output_stage1 = x
                 H1, W1 = H, W
-            if idx == 1:  # Second stage
-                output_stage2 = x
-                H2, W2 = H, W
-            if idx == 2:  # Third stage
-                output_stage3 = x
-                H3, W3 = H, W
-            if idx == 3:  # Fourth stage (last)
+            if idx == 3:  # Fourth stage
                 output_stage4 = x
                 H4, W4 = H, W
 
         x = self.norm(x)  # Final normalization
         x = self.avgpool(x.transpose(1, 2))  # Pooling
         x = torch.flatten(x, 1)
-        return x, output_stage1, H1, W1, output_stage2, H2, W2, output_stage3, H3, W3, output_stage4, H4, W4
+        return x, output_stage1, H1, W1, output_stage4, H4, W4
 
     def forward(self, x):
         b, t, c, h, w = x.size()
         if self.tubelet_size == 1:
             x = x.reshape(-1, c, h, w)
 
-        x, output_stage1, H1, W1, output_stage2, H2, W2, output_stage3, H3, W3, output_stage4, H4, W4 = self.forward_features(x)
+        x, output_stage1, H1, W1, output_stage4, H4, W4 = self.forward_features(x)
         B = x.shape[0]  # Batch size
 
         # Check if outputs are captured
-        if output_stage1 is not None and output_stage2 is not None and output_stage3 is not None and output_stage4 is not None:
+        if output_stage1 is not None and output_stage4 is not None:
             # Project outputs to the same channel dimension
-            output_stage1 = self.lateral_layer1(output_stage1)  # [B, L1, fuse_dim]
-            output_stage2 = self.lateral_layer2(output_stage2)  # [B, L2, fuse_dim]
-            output_stage3 = self.lateral_layer3(output_stage3)  # [B, L3, fuse_dim]
+            output_stage1 = self.lateral_layer1(output_stage1)  # [B, L2, fuse_dim]
             output_stage4 = self.lateral_layer4(output_stage4)  # [B, L4, fuse_dim]
-
-            # Reshape to [B, C, H, W]
+            
             output_stage1 = output_stage1.transpose(1, 2).view(B, self.fuse_dim, H1, W1)
-            output_stage2 = output_stage2.transpose(1, 2).view(B, self.fuse_dim, H2, W2)
-            output_stage3 = output_stage3.transpose(1, 2).view(B, self.fuse_dim, H3, W3)
             output_stage4 = output_stage4.transpose(1, 2).view(B, self.fuse_dim, H4, W4)
 
-            # Upsample lower resolution outputs to match the highest resolution
+            # Upsample output_stage4 to match spatial dimensions of output_stage1
             output_stage4_upsampled = F.interpolate(output_stage4, size=(H1, W1), mode='bilinear', align_corners=False)
-            output_stage3_upsampled = F.interpolate(output_stage3, size=(H1, W1), mode='bilinear', align_corners=False)
-            output_stage2_upsampled = F.interpolate(output_stage2, size=(H1, W1), mode='bilinear', align_corners=False)
 
             # Fuse the outputs (addition)
-            fused_output = output_stage1 + output_stage2_upsampled + output_stage3_upsampled + output_stage4_upsampled
+            fused_output = output_stage1 + output_stage4_upsampled
 
             # Apply smoothing
             fused_output = self.fuse_smooth(fused_output)
@@ -626,7 +624,6 @@ class VideoFocalNet(nn.Module):
         x = x.mean(dim=1)
         x = self.head(x)
         return x
-
 
 def build_transforms(img_size, center_crop=False):
     t = []
@@ -695,7 +692,6 @@ def videofocalnet_base(pretrained=False, **kwargs):
         checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
         model.load_state_dict(checkpoint["model"])
     return model
-
 
 if __name__ == '__main__':
     print('test')

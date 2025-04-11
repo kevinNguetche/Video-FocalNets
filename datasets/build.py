@@ -262,7 +262,7 @@ def mmcv_collate(batch, samples_per_gpu=1):
 
 def build_dataloader(logger, config):
     scale_resize = int(256 / 224 * config.DATA.INPUT_SIZE)
-    prefix = config.DATA.PREFIX
+
     train_pipeline = [
         dict(type='DecordInit'),
         dict(type='SampleFrames', clip_len=1, frame_interval=config.AUG.FRAME_INTERVAL, num_clips=config.DATA.NUM_FRAMES),
@@ -286,7 +286,7 @@ def build_dataloader(logger, config):
     ]
         
     
-    train_data = VideoDataset(ann_file=config.DATA.TRAIN_FILE, data_prefix=prefix,
+    train_data = VideoDataset(ann_file=config.DATA.TRAIN_FILE, data_prefix=config.DATA.ROOT,
                               labels_file=config.DATA.LABEL_LIST, pipeline=train_pipeline)
     num_tasks = dist.get_world_size()
     global_rank = dist.get_rank()
@@ -319,12 +319,12 @@ def build_dataloader(logger, config):
     if config.TEST.NUM_CLIP > 1:
         val_pipeline[1] = dict(type='SampleFrames', clip_len=1, frame_interval=1, num_clips=config.DATA.NUM_FRAMES, multiview=config.TEST.NUM_CLIP)
     
-    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=prefix, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline)
+    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline)
     indices = np.arange(dist.get_rank(), len(val_data), dist.get_world_size())
     sampler_val = SubsetRandomSampler(indices)
     val_loader = DataLoader(
         val_data, sampler=sampler_val,
-        batch_size=8,
+        batch_size=2,
         num_workers=16,
         pin_memory=True,
         drop_last=True,
