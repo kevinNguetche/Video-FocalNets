@@ -58,12 +58,12 @@ def parse_option():
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
 
     # distributed training
-    #parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
 
     args, unparsed = parser.parse_known_args()
-    
-    args.local_rank = "cuda:"+os.getenv("LOCAL_RANK")
+
     config = get_config(args)
+
     return args, config
 
 
@@ -75,7 +75,6 @@ def main(config):
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     
     model = build_model(config)
-    
     if config.TRAIN.PRETRAINED_PATH:
         ckpt = torch.load(config.TRAIN.PRETRAINED_PATH, map_location='cpu')
         
@@ -153,12 +152,11 @@ def main(config):
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
 
-        if epoch == (config.TRAIN.EPOCHS - 1) or epoch % 2 == 0 :
-            acc1 = validate(config, data_loader_val, model)
-                
-            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-            max_accuracy = max(max_accuracy, acc1)
-            logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        acc1 = validate(config, data_loader_val, model)
+
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+        max_accuracy = max(max_accuracy, acc1)
+        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
     
     config.defrost()
     config.TEST.NUM_CLIP = 4
@@ -330,7 +328,7 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
-    
+
     # linear scale the learning rate according to total batch size, may not be optimal
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
