@@ -1,7 +1,7 @@
 DATA:
     ROOT: ''
-    TRAIN_FILE: 'datasets/train_k400_s.csv'
-    VAL_FILE: 'datasets/val_k400_s.csv'
+    TRAIN_FILE: ''
+    VAL_FILE: ''
     DATASET: kinetics400
     NUM_FRAMES: 8
     NUM_CLASSES: 400
