@@ -151,12 +151,13 @@ def main(config):
         
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
+        
+        if epoch == (config.TRAIN.EPOCHS - 1) or epoch == 1 or epoch == 3 or epoch % 5 == 0 or epoch > 40:
+            acc1 = validate(config, data_loader_val, model)
 
-        acc1 = validate(config, data_loader_val, model)
-
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+            max_accuracy = max(max_accuracy, acc1)
+            logger.info(f'Max accuracy: {max_accuracy:.2f}%')
     
     config.defrost()
     config.TEST.NUM_CLIP = 4
